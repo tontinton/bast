@@ -29,6 +29,36 @@ enum RespValue {
     Set(HashSet<RespValue>),
 }
 
+enum RespValueIndices {
+    BlobString(usize, usize),
+    SimpleString(usize, usize),
+    Array(Vec<RespValueIndices>),
+}
+
+impl RespValueIndices {
+    fn to_value(self, buf: &Bytes) -> Result<RespValue, RESPError> {
+        match self {
+            RespValueIndices::SimpleString(start, end) => {
+                let v = buf[start..end].to_vec();
+                let s = String::from_utf8(v).map_err(|_| RESPError::StringParseEncodingError)?;
+                Ok(RespValue::SimpleString(s))
+            },
+            RespValueIndices::BlobString(start, end) => {
+                let v = buf[start..end].to_vec();
+                let s = String::from_utf8(v).map_err(|_| RESPError::StringParseEncodingError)?;
+                Ok(RespValue::BlobString(s))
+            },
+            RespValueIndices::Array(indices_arr) => {
+                let mut values = Vec::with_capacity(indices_arr.len());
+                for indices in indices_arr.into_iter() {
+                    values.push(indices.to_value(buf)?);
+                }
+                Ok(RespValue::Array(values))
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RESPError {
     UnsupportedValue,
@@ -53,44 +83,67 @@ fn parse_integer(slice: &[u8]) -> Result<i64, RESPError> {
 }
 
 fn get_next_word_end(buf: &mut BytesMut, start: usize) -> Option<usize> {
-    memchr(BREAK_FIRST_CHAR, &buf[start..])
+    memchr(BREAK_FIRST_CHAR, &buf[start..]).map(|end| start + end)
 }
 
-fn word_to_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<Option<String>, RESPError> {
-    let end_of_expression = end + WORD_BREAK.len();
-    if buf.len() <= end_of_expression - 1 {
-        return Ok(None);
-    }
-
-    if &buf[end_of_expression - WORD_BREAK.len()..end_of_expression] != WORD_BREAK.as_bytes() {
-        return Err(RESPError::WordNotEndingWithNewLine);
-    }
-
-    let raw_expression = buf.split_to(end_of_expression);
-
-    let v = raw_expression.freeze().slice(start..end).to_vec();
-    let s = String::from_utf8(v).map_err(|_| RESPError::StringParseEncodingError)?;
-    Ok(Some(s))
+fn word_ends_with_break(buf: &BytesMut, word_end: usize) -> bool {
+    &buf[word_end..word_end + WORD_BREAK.len()] == WORD_BREAK.as_bytes()
 }
 
-fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Result<Option<RespValue>, RESPError> {
-    let str_size = parse_integer(&buf[int_start..int_end])? as usize;
+fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
+    let str_size = parse_integer(&buf[int_start..int_end])? as usize; // TODO: return Null on -1
     let str_start = int_end + WORD_BREAK.len();
     let str_end = str_start + str_size;
 
-    Ok(word_to_string(buf, str_start, str_end)?.and_then(|s| Some(RespValue::BlobString(s))))
+    // TODO: don't trust str_size, use `get_next_word_end`
+
+    if buf.len() < str_end + WORD_BREAK.len() {
+        return Ok(None);
+    }
+
+    if !word_ends_with_break(buf, str_end) {
+        return Err(RESPError::WordNotEndingWithNewLine);
+    }
+
+    Ok(Some((RespValueIndices::BlobString(str_start, str_end), str_end + WORD_BREAK.len())))
 }
 
-fn parse_simple_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<Option<RespValue>, RESPError> {
-    word_to_string(buf, start, end)?.map_or(Ok(None), |s| {
-        match memchr(NEW_LINE, s.as_bytes()) {
-            Some(_) => Err(RESPError::NewLineInSimpleString),
-            None => Ok(Some(RespValue::SimpleString(s)))
-        }   
-    })
+fn parse_simple_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
+    if buf.len() < end + WORD_BREAK.len() {
+        return Ok(None);
+    }
+
+    if !word_ends_with_break(buf, end) {
+        return Err(RESPError::WordNotEndingWithNewLine);
+    }
+
+    match memchr(NEW_LINE, &buf[start..end]) {
+        Some(_) => Err(RESPError::NewLineInSimpleString),
+        None => Ok(Some((RespValueIndices::SimpleString(start, end), end + WORD_BREAK.len())))
+    }   
 }
 
-fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<RespValue>, RESPError> {
+fn parse_array(buf: &mut BytesMut, size_start: usize, size_end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
+    let size = parse_integer(&buf[size_start..size_end])? as usize; // TODO: return Null on -1
+
+    let start_of_expressions = size_end + WORD_BREAK.len();
+    let mut next_start = start_of_expressions;
+
+    let mut values: Vec<RespValueIndices> = Vec::with_capacity(size);
+    for _ in 0..size {
+        values.push(match parse_expression(buf, next_start)? {
+            Some(value) => {
+                next_start = value.1;
+                value.0
+            },
+            None => return Ok(None)
+        });
+    }
+
+    Ok(Some((RespValueIndices::Array(values), next_start)))
+}
+
+fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
     if buf.len() < start {
         return Ok(None);
     }
@@ -99,6 +152,7 @@ fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<RespValue
         match buf[start] {
             b'$' => parse_blob_string(buf, start + 1, end),
             b'+' => parse_simple_string(buf, start + 1, end),
+            b'*' => parse_array(buf, start + 1, end),
             _ => Err(RESPError::UnsupportedValue)
         }
     })
@@ -129,7 +183,13 @@ impl Decoder for RespCodec {
             return Ok(None);
         }
 
-        parse_expression(buf, 0)
+        match parse_expression(buf, 0)? {
+            Some((value_indices, split_index)) => {
+                let raw_expression = buf.split_to(split_index).freeze();
+                Ok(Some(value_indices.to_value(&raw_expression)?))
+            },
+            None => Ok(None)
+        }
     }
 }
 
@@ -142,6 +202,26 @@ impl Encoder<RespValue> for RespCodec {
     }
 }
 
+fn print_resp_value_tabbed(value: &RespValue, num_of_tabs: usize) {
+    let t = "  ".repeat(num_of_tabs);
+    match value {
+        RespValue::BlobString(text) => println!("{}blob string: {}", t, text),
+        RespValue::SimpleString(text) => println!("{}simple string: {}", t, text),
+        RespValue::Array(arr) => {
+            println!("{}simple array({}) {{", t, arr.len());
+            for v in arr {
+                print_resp_value_tabbed(v, num_of_tabs + 1);
+            }
+            println!("{}}}", t);
+        },
+        _ => println!("{}??", t)
+    }
+}
+
+fn print_resp_value(value: &RespValue) {
+    print_resp_value_tabbed(value, 0)
+}
+
 async fn handle_connection(socket: TcpStream) {
     let maybe_addr = socket.peer_addr().ok();
 
@@ -150,32 +230,17 @@ async fn handle_connection(socket: TcpStream) {
     while let Some(result) = reader.next().await {
         match result {
             Ok(value) => {
-                match &value {
-                    RespValue::BlobString(text) => {
-                        println!("blob string: {}", text);
-                    },
-                    RespValue::SimpleString(text) => {
-                        println!("simple string: {}", text);
-                    },
-                    _ => {
-                        println!("??");
-                    }
-                }
+                print_resp_value(&value);
+                println!("");
                 writer.send(value).await.unwrap();
             },
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
-            }
+            Err(e) => eprintln!("Error: {:?}", e)
         }
     }
 
     match maybe_addr {
-        Some(addr) => {
-            println!("Closing connection from {}", addr);
-        },
-        None => {
-            eprintln!("Closing connection");
-        }
+        Some(addr) => println!("Closing connection from {}", addr),
+        None => eprintln!("Closing connection")
     }
 }
 
