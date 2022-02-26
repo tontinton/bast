@@ -15,7 +15,7 @@ const NEW_LINE: u8 = b'\n';
 // RESP3 protocol
 // TODO: Add all missing types
 // https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md
-enum RespValue {
+enum RESPValue {
     BlobString(String),
     SimpleString(String),
     BlobError(Bytes),
@@ -24,37 +24,39 @@ enum RespValue {
     Double(f64),
     Boolean(bool),
     Null,
-    Array(Vec<RespValue>),
-    Map(HashMap<Bytes, RespValue>), // TODO: Add integers + booleans? as valid keys (separate types?)
-    Set(HashSet<RespValue>),
+    Array(Vec<RESPValue>),
+    Map(HashMap<Bytes, RESPValue>), // TODO: Add integers + booleans? as valid keys (separate types?)
+    Set(HashSet<RESPValue>),
 }
 
-enum RespValueIndices {
+enum RESPValueIndices {
     BlobString(usize, usize),
     SimpleString(usize, usize),
-    Array(Vec<RespValueIndices>),
+    Array(Vec<RESPValueIndices>),
+    Null,
 }
 
-impl RespValueIndices {
-    fn to_value(self, buf: &Bytes) -> Result<RespValue, RESPError> {
+impl RESPValueIndices {
+    fn to_value(self, buf: &Bytes) -> Result<RESPValue, RESPError> {
         match self {
-            RespValueIndices::SimpleString(start, end) => {
+            RESPValueIndices::SimpleString(start, end) => {
                 let v = buf[start..end].to_vec();
                 let s = String::from_utf8(v).map_err(|_| RESPError::StringParseEncodingError)?;
-                Ok(RespValue::SimpleString(s))
+                Ok(RESPValue::SimpleString(s))
             },
-            RespValueIndices::BlobString(start, end) => {
+            RESPValueIndices::BlobString(start, end) => {
                 let v = buf[start..end].to_vec();
                 let s = String::from_utf8(v).map_err(|_| RESPError::StringParseEncodingError)?;
-                Ok(RespValue::BlobString(s))
+                Ok(RESPValue::BlobString(s))
             },
-            RespValueIndices::Array(indices_arr) => {
+            RESPValueIndices::Array(indices_arr) => {
                 let mut values = Vec::with_capacity(indices_arr.len());
                 for indices in indices_arr.into_iter() {
                     values.push(indices.to_value(buf)?);
                 }
-                Ok(RespValue::Array(values))
-            }
+                Ok(RESPValue::Array(values))
+            },
+            RESPValueIndices::Null => Ok(RESPValue::Null)
         }
     }
 }
@@ -64,6 +66,7 @@ pub enum RESPError {
     UnsupportedValue,
     WordNotEndingWithNewLine,
     NewLineInSimpleString,
+    InvalidNumberSize,
     IntegerParseEncodingError,
     IntegerParseError,
     StringParseEncodingError,
@@ -90,12 +93,19 @@ fn word_ends_with_break(buf: &BytesMut, word_end: usize) -> bool {
     &buf[word_end..word_end + WORD_BREAK.len()] == WORD_BREAK.as_bytes()
 }
 
-fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
-    let str_size = parse_integer(&buf[int_start..int_end])? as usize; // TODO: return Null on -1
+fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Result<Option<(RESPValueIndices, usize)>, RESPError> {
     let str_start = int_end + WORD_BREAK.len();
-    let str_end = str_start + str_size;
+    
+    let str_size = parse_integer(&buf[int_start..int_end])?;
+    if str_size < 0 {
+        return Ok(Some((RESPValueIndices::Null, int_end + WORD_BREAK.len())));
+    } else if str_size == 0 {
+        return Ok(Some((RESPValueIndices::BlobString(str_start, str_start), int_end + WORD_BREAK.len())));
+    }
 
-    // TODO: don't trust str_size, use `get_next_word_end`
+    let maybe_next_word_end = get_next_word_end(buf, str_start);
+    if maybe_next_word_end.is_none() { return Ok(None); }
+    let str_end = maybe_next_word_end.unwrap();
 
     if buf.len() < str_end + WORD_BREAK.len() {
         return Ok(None);
@@ -105,10 +115,15 @@ fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Re
         return Err(RESPError::WordNotEndingWithNewLine);
     }
 
-    Ok(Some((RespValueIndices::BlobString(str_start, str_end), str_end + WORD_BREAK.len())))
+
+    if str_size as usize != str_end - str_start {
+        return Err(RESPError::InvalidNumberSize);
+    }
+
+    Ok(Some((RESPValueIndices::BlobString(str_start, str_end), str_end + WORD_BREAK.len())))
 }
 
-fn parse_simple_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
+fn parse_simple_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<Option<(RESPValueIndices, usize)>, RESPError> {
     if buf.len() < end + WORD_BREAK.len() {
         return Ok(None);
     }
@@ -119,18 +134,23 @@ fn parse_simple_string(buf: &mut BytesMut, start: usize, end: usize) -> Result<O
 
     match memchr(NEW_LINE, &buf[start..end]) {
         Some(_) => Err(RESPError::NewLineInSimpleString),
-        None => Ok(Some((RespValueIndices::SimpleString(start, end), end + WORD_BREAK.len())))
+        None => Ok(Some((RESPValueIndices::SimpleString(start, end), end + WORD_BREAK.len())))
     }   
 }
 
-fn parse_array(buf: &mut BytesMut, size_start: usize, size_end: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
-    let size = parse_integer(&buf[size_start..size_end])? as usize; // TODO: return Null on -1
+fn parse_array(buf: &mut BytesMut, size_start: usize, size_end: usize) -> Result<Option<(RESPValueIndices, usize)>, RESPError> {
+    let mut next_start = size_end + WORD_BREAK.len();
 
-    let start_of_expressions = size_end + WORD_BREAK.len();
-    let mut next_start = start_of_expressions;
+    let signed_size = parse_integer(&buf[size_start..size_end])?;
+    if signed_size < 0 {
+        return Ok(Some((RESPValueIndices::Null, size_end + WORD_BREAK.len())));
+    } else if signed_size == 0 {
+        return Ok(Some((RESPValueIndices::Array(vec![]), next_start)));
+    }
+    let unsigned_size = signed_size as usize;
 
-    let mut values: Vec<RespValueIndices> = Vec::with_capacity(size);
-    for _ in 0..size {
+    let mut values: Vec<RESPValueIndices> = Vec::with_capacity(unsigned_size);
+    for _ in 0..unsigned_size {
         values.push(match parse_expression(buf, next_start)? {
             Some(value) => {
                 next_start = value.1;
@@ -140,10 +160,10 @@ fn parse_array(buf: &mut BytesMut, size_start: usize, size_end: usize) -> Result
         });
     }
 
-    Ok(Some((RespValueIndices::Array(values), next_start)))
+    Ok(Some((RESPValueIndices::Array(values), next_start)))
 }
 
-fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<(RespValueIndices, usize)>, RESPError> {
+fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<(RESPValueIndices, usize)>, RESPError> {
     if buf.len() < start {
         return Ok(None);
     }
@@ -158,12 +178,12 @@ fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<(RespValu
     })
 }
 
-fn write_resp_value(value: RespValue, buf: &mut BytesMut) -> Result<(), std::fmt::Error> {
+fn write_resp_value(value: RESPValue, buf: &mut BytesMut) -> Result<(), std::fmt::Error> {
     match value {
-        RespValue::BlobString(s) => {
+        RESPValue::BlobString(s) => {
             write!(buf, "${}\r\n{}\r\n", s.len(), s)?;
         },
-        RespValue::SimpleString(s) => {
+        RESPValue::SimpleString(s) => {
             write!(buf, "+{}\r\n", s)?;
         },
         _ => {}
@@ -175,7 +195,7 @@ fn write_resp_value(value: RespValue, buf: &mut BytesMut) -> Result<(), std::fmt
 struct RespCodec;
 
 impl Decoder for RespCodec {
-    type Item = RespValue;
+    type Item = RESPValue;
     type Error = RESPError;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -193,32 +213,33 @@ impl Decoder for RespCodec {
     }
 }
 
-impl Encoder<RespValue> for RespCodec {
+impl Encoder<RESPValue> for RespCodec {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: RespValue, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: RESPValue, dst: &mut BytesMut) -> Result<(), Self::Error> {
         write_resp_value(item, dst).unwrap();
         Ok(())
     }
 }
 
-fn print_resp_value_tabbed(value: &RespValue, num_of_tabs: usize) {
+fn print_resp_value_tabbed(value: &RESPValue, num_of_tabs: usize) {
     let t = "  ".repeat(num_of_tabs);
     match value {
-        RespValue::BlobString(text) => println!("{}blob string: {}", t, text),
-        RespValue::SimpleString(text) => println!("{}simple string: {}", t, text),
-        RespValue::Array(arr) => {
+        RESPValue::BlobString(text) => println!("{}blob string: {}", t, text),
+        RESPValue::SimpleString(text) => println!("{}simple string: {}", t, text),
+        RESPValue::Array(arr) => {
             println!("{}simple array({}) {{", t, arr.len());
             for v in arr {
                 print_resp_value_tabbed(v, num_of_tabs + 1);
             }
             println!("{}}}", t);
         },
+        RESPValue::Null => println!("{}null", t),
         _ => println!("{}??", t)
     }
 }
 
-fn print_resp_value(value: &RespValue) {
+fn print_resp_value(value: &RESPValue) {
     print_resp_value_tabbed(value, 0)
 }
 
