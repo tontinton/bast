@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
-use std::str::FromStr;
 
 use enum_as_inner::EnumAsInner;
 use bytes::{Bytes, BytesMut};
@@ -125,7 +124,7 @@ fn word_ends_with_break(buf: &BytesMut, word_end: usize) -> bool {
 
 fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Result<Option<(RESPValueIndices, usize)>, RESPError> {
     let str_start = int_end + WORD_BREAK.len();
-    
+
     let str_size = parse_integer(&buf[int_start..int_end])?;
     if str_size < 0 {
         return Ok(Some((RESPValueIndices::Null, int_end + WORD_BREAK.len())));
@@ -144,7 +143,6 @@ fn parse_blob_string(buf: &mut BytesMut, int_start: usize, int_end: usize) -> Re
     if !word_ends_with_break(buf, str_end) {
         return Err(RESPError::WordNotEndingWithNewLine);
     }
-
 
     if str_size as usize != str_end - str_start {
         return Err(RESPError::InvalidNumberSize);
@@ -208,7 +206,7 @@ fn parse_expression(buf: &mut BytesMut, start: usize) -> Result<Option<(RESPValu
     })
 }
 
-fn write_resp_value(value: RESPValue, buf: &mut BytesMut) -> Result<(), std::fmt::Error> {
+fn write_resp_value(value: RESPValue, buf: &mut BytesMut) -> std::fmt::Result {
     match value {
         RESPValue::BlobString(s) => {
             write!(buf, "${}\r\n{}\r\n", s.len(), s)?;
