@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
+use std::str::FromStr;
 
+use enum_as_inner::EnumAsInner;
 use bytes::{Bytes, BytesMut};
 use memchr::memchr;
 use tokio::net::TcpListener;
@@ -15,6 +17,7 @@ const NEW_LINE: u8 = b'\n';
 // RESP3 protocol
 // TODO: Add all missing types
 // https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md
+#[derive(Debug, EnumAsInner, Clone)]
 enum RESPValue {
     BlobString(String),
     SimpleString(String),
@@ -186,15 +189,18 @@ fn write_resp_value(value: RESPValue, buf: &mut BytesMut) -> Result<(), std::fmt
         RESPValue::SimpleString(s) => {
             write!(buf, "+{}\r\n", s)?;
         },
+        RESPValue::Null => {
+            write!(buf, "$-1\r\n")?;
+        }
         _ => {}
     }
     Ok(())
 }
 
 #[derive(Default)]
-struct RespCodec;
+struct RESPCodec;
 
-impl Decoder for RespCodec {
+impl Decoder for RESPCodec {
     type Item = RESPValue;
     type Error = RESPError;
 
@@ -213,7 +219,7 @@ impl Decoder for RespCodec {
     }
 }
 
-impl Encoder<RESPValue> for RespCodec {
+impl Encoder<RESPValue> for RESPCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: RESPValue, dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -243,17 +249,52 @@ fn print_resp_value(value: &RESPValue) {
     print_resp_value_tabbed(value, 0)
 }
 
+fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Option<RESPValue> {
+    let command_type = &command[0];
+    match command_type.as_str() {
+        "GET" => {
+            let key = command[1].to_owned();
+            let value = map.get(&key).map(|v| v.clone()).unwrap_or(RESPValue::Null);
+            Some(value)
+        },
+        "SET" => {
+            let key = command[1].to_owned();
+            let old_value = map.insert(key, RESPValue::BlobString(command[2].to_owned()));
+            Some(old_value.unwrap_or(RESPValue::SimpleString(String::from("OK"))))
+        },
+        _ => None
+    }
+}
+
 async fn handle_connection(socket: TcpStream) {
     let maybe_addr = socket.peer_addr().ok();
 
-    let (mut writer, mut reader) = RespCodec::default().framed(socket).split();
+    let (mut writer, mut reader) = RESPCodec::default().framed(socket).split();
+
+    let mut map: HashMap<String, RESPValue> = HashMap::new();
 
     while let Some(result) = reader.next().await {
         match result {
             Ok(value) => {
                 print_resp_value(&value);
                 println!("");
-                writer.send(value).await.unwrap();
+                match value {
+                    RESPValue::Array(values) => {
+                        if values.len() == 0 {
+                            println!("A request must not be an empty array");
+                            continue;
+                        } else if !values.iter().all(|v| matches!(v, RESPValue::BlobString(_))) {
+                            println!("A request must be an array of only blob strings");
+                            continue;
+                        }
+
+                        let commands = values.into_iter().map(|v| v.into_blob_string().unwrap()).collect();
+                        if let Some(response) = handle_request(commands, &mut map) {
+                            writer.send(response).await.unwrap();
+                        }
+                    },
+                    _ => println!("A request must be an array")
+                }
             },
             Err(e) => eprintln!("Error: {:?}", e)
         }
@@ -261,7 +302,7 @@ async fn handle_connection(socket: TcpStream) {
 
     match maybe_addr {
         Some(addr) => println!("Closing connection from {}", addr),
-        None => eprintln!("Closing connection")
+        None => println!("Closing connection")
     }
 }
 
