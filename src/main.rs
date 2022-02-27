@@ -32,6 +32,31 @@ enum RESPValue {
     Set(HashSet<RESPValue>),
 }
 
+impl RESPValue {
+    fn write_format_tabbed(&self, f: &mut std::fmt::Formatter, num_of_tabs: usize) -> std::fmt::Result {
+        let t = "  ".repeat(num_of_tabs);
+        match self {
+            RESPValue::BlobString(text) => writeln!(f, "{}blob string: {}", t, text),
+            RESPValue::SimpleString(text) => writeln!(f, "{}simple string: {}", t, text),
+            RESPValue::Array(arr) => {
+                writeln!(f, "{}<{}> {{", t, arr.len())?;
+                for v in arr {
+                    v.write_format_tabbed(f, num_of_tabs + 1)?;
+                }
+                writeln!(f, "{}}}", t)
+            },
+            RESPValue::Null => writeln!(f, "{}null", t),
+            _ => writeln!(f, "{}?", t)
+        }
+    }
+}
+
+impl std::fmt::Display for RESPValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.write_format_tabbed(f, 0)
+    }
+}
+
 enum RESPValueIndices {
     BlobString(usize, usize),
     SimpleString(usize, usize),
@@ -230,27 +255,6 @@ impl Encoder<RESPValue> for RESPCodec {
     }
 }
 
-fn print_resp_value_tabbed(value: &RESPValue, num_of_tabs: usize) {
-    let t = "  ".repeat(num_of_tabs);
-    match value {
-        RESPValue::BlobString(text) => println!("{}blob string: {}", t, text),
-        RESPValue::SimpleString(text) => println!("{}simple string: {}", t, text),
-        RESPValue::Array(arr) => {
-            println!("{}simple array({}) {{", t, arr.len());
-            for v in arr {
-                print_resp_value_tabbed(v, num_of_tabs + 1);
-            }
-            println!("{}}}", t);
-        },
-        RESPValue::Null => println!("{}null", t),
-        _ => println!("{}??", t)
-    }
-}
-
-fn print_resp_value(value: &RESPValue) {
-    print_resp_value_tabbed(value, 0)
-}
-
 fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Result<RESPValue, RESPError> {
     let command_type = command[0].as_str();
     match command_type {
@@ -286,8 +290,7 @@ async fn handle_connection(socket: TcpStream) {
     while let Some(result) = reader.next().await {
         match result {
             Ok(value) => {
-                print_resp_value(&value);
-                println!("");
+                println!("{}", value);
                 match value {
                     RESPValue::Array(values) => {
                         if values.len() == 0 {
