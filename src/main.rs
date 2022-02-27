@@ -70,6 +70,8 @@ pub enum RESPError {
     WordNotEndingWithNewLine,
     NewLineInSimpleString,
     InvalidNumberSize,
+    WrongNumberOfArguments(String),
+    UnsupportedCommand,
     IntegerParseEncodingError,
     IntegerParseError,
     StringParseEncodingError,
@@ -249,20 +251,28 @@ fn print_resp_value(value: &RESPValue) {
     print_resp_value_tabbed(value, 0)
 }
 
-fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Option<RESPValue> {
-    let command_type = &command[0];
-    match command_type.as_str() {
+fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Result<RESPValue, RESPError> {
+    let command_type = command[0].as_str();
+    match command_type {
         "GET" => {
+            if command.len() != 2 {
+                return Err(RESPError::WrongNumberOfArguments(command[0].to_owned()));
+            }
+
             let key = command[1].to_owned();
             let value = map.get(&key).map(|v| v.clone()).unwrap_or(RESPValue::Null);
-            Some(value)
+            Ok(value)
         },
         "SET" => {
+            if command.len() != 3 {
+                return Err(RESPError::WrongNumberOfArguments(command[0].to_owned()));
+            }
+
             let key = command[1].to_owned();
             let old_value = map.insert(key, RESPValue::BlobString(command[2].to_owned()));
-            Some(old_value.unwrap_or(RESPValue::SimpleString(String::from("OK"))))
+            Ok(old_value.unwrap_or(RESPValue::SimpleString(String::from("OK"))))
         },
-        _ => None
+        _ => Err(RESPError::UnsupportedCommand)
     }
 }
 
@@ -289,8 +299,9 @@ async fn handle_connection(socket: TcpStream) {
                         }
 
                         let commands = values.into_iter().map(|v| v.into_blob_string().unwrap()).collect();
-                        if let Some(response) = handle_request(commands, &mut map) {
-                            writer.send(response).await.unwrap();
+                        match handle_request(commands, &mut map) {
+                            Ok(response) => writer.send(response).await.unwrap(),
+                            Err(e) => eprintln!("Error: {:?}", e)
                         }
                     },
                     _ => println!("A request must be an array")
