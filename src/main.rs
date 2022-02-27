@@ -39,11 +39,11 @@ impl RESPValue {
             RESPValue::BlobString(text) => writeln!(f, "{}blob string: {}", t, text),
             RESPValue::SimpleString(text) => writeln!(f, "{}simple string: {}", t, text),
             RESPValue::Array(arr) => {
-                writeln!(f, "{}<{}> {{", t, arr.len())?;
+                writeln!(f, "{}array({}) [", t, arr.len())?;
                 for v in arr {
                     v.write_format_tabbed(f, num_of_tabs + 1)?;
                 }
-                writeln!(f, "{}}}", t)
+                writeln!(f, "{}]", t)
             },
             RESPValue::Null => writeln!(f, "{}null", t),
             _ => writeln!(f, "{}?", t)
@@ -290,7 +290,11 @@ async fn handle_connection(socket: TcpStream) {
     while let Some(result) = reader.next().await {
         match result {
             Ok(value) => {
-                println!("{}", value);
+                if cfg!(debug_assertions) {
+                    println!("{}", value);
+                    println!("");
+                }
+
                 match value {
                     RESPValue::Array(values) => {
                         if values.len() == 0 {
@@ -314,9 +318,11 @@ async fn handle_connection(socket: TcpStream) {
         }
     }
 
-    match maybe_addr {
-        Some(addr) => println!("Closing connection from {}", addr),
-        None => println!("Closing connection")
+    if cfg!(debug_assertions) {
+        match maybe_addr {
+            Some(addr) => println!("Closing connection from {}", addr),
+            None => println!("Closing connection")
+        }
     }
 }
 
@@ -327,7 +333,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (socket, _) = listener.accept().await?;
         match socket.peer_addr() {
             Ok(addr) => {
-                println!("New connection from {}", addr);
+                if cfg!(debug_assertions) {
+                    println!("New connection from {}", addr);
+                }
                 tokio::spawn(handle_connection(socket));        
             },
             Err(e) => {
