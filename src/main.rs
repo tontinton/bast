@@ -334,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cfg!(debug_assertions) {
                     println!("New connection from {}", addr);
                 }
-                tokio::spawn(handle_connection(socket));        
+                tokio::spawn(handle_connection(socket));
             },
             Err(e) => {
                 eprintln!("Failed to get the address of a new connection: {:?}", e);
