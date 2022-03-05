@@ -253,7 +253,8 @@ impl Encoder<RESPValue> for RESPCodec {
     }
 }
 
-fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Result<RESPValue, RESPError> {
+fn handle_request(command: Vec<String>, ptr: usize) -> Result<RESPValue, RESPError> {
+    let map = ptr as *mut HashMap<String, RESPValue>;
     let command_type = command[0].as_str();
     match command_type {
         "GET" => {
@@ -262,8 +263,11 @@ fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) ->
             }
 
             let key = command[1].to_owned();
-            let value = map.get(&key).map(|v| v.clone()).unwrap_or(RESPValue::Null);
-            Ok(value)
+
+            unsafe {
+                let value = (*map).get(&key).map(|v| v.clone()).unwrap_or(RESPValue::Null);
+                Ok(value)
+            }
         },
         "SET" => {
             if command.len() != 3 {
@@ -271,19 +275,19 @@ fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) ->
             }
 
             let key = command[1].to_owned();
-            let old_value = map.insert(key, RESPValue::BlobString(command[2].to_owned()));
-            Ok(old_value.unwrap_or(RESPValue::SimpleString(String::from("OK"))))
+            unsafe {
+                let old_value = (*map).insert(key, RESPValue::BlobString(command[2].to_owned())); 
+                Ok(old_value.unwrap_or(RESPValue::SimpleString(String::from("OK"))))
+            }
         },
         _ => Err(RESPError::UnsupportedCommand)
     }
 }
 
-async fn handle_connection(socket: TcpStream) {
+async fn handle_connection(socket: TcpStream, ptr: usize) {
     let maybe_addr = socket.peer_addr().ok();
 
     let (mut writer, mut reader) = RESPCodec::default().framed(socket).split();
-
-    let mut map: HashMap<String, RESPValue> = HashMap::new();
 
     while let Some(result) = reader.next().await {
         match result {
@@ -304,10 +308,10 @@ async fn handle_connection(socket: TcpStream) {
                         }
 
                         let commands = values.into_iter().map(|v| v.into_blob_string().unwrap()).collect();
-                        match handle_request(commands, &mut map) {
+                        match handle_request(commands, ptr) {
                             Ok(response) => writer.send(response).await.unwrap(),
                             Err(e) => eprintln!("Error: {:?}", e)
-                        }
+                        }    
                     },
                     _ => println!("A request must be an array")
                 }
@@ -327,6 +331,8 @@ async fn handle_connection(socket: TcpStream) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    let mut map: HashMap<String, RESPValue> = HashMap::new();
+    let ptr = (&mut map as *mut HashMap<String, RESPValue>) as usize;
     loop {
         let (socket, _) = listener.accept().await?;
         match socket.peer_addr() {
@@ -334,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cfg!(debug_assertions) {
                     println!("New connection from {}", addr);
                 }
-                tokio::spawn(handle_connection(socket));
+                tokio::spawn(handle_connection(socket, ptr));
             },
             Err(e) => {
                 eprintln!("Failed to get the address of a new connection: {:?}", e);
