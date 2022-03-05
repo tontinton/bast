@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 use futures::{StreamExt, SinkExt};
+use dashmap::DashMap;
 
 const WORD_BREAK: &str = "\r\n";
 const BREAK_FIRST_CHAR: u8 = b'\r';
@@ -253,7 +254,7 @@ impl Encoder<RESPValue> for RESPCodec {
     }
 }
 
-fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) -> Result<RESPValue, RESPError> {
+fn handle_request(command: Vec<String>, map: std::sync::Arc<DashMap<String, RESPValue>>) -> Result<RESPValue, RESPError> {
     let command_type = command[0].as_str();
     match command_type {
         "GET" => {
@@ -278,12 +279,10 @@ fn handle_request(command: Vec<String>, map: &mut HashMap<String, RESPValue>) ->
     }
 }
 
-async fn handle_connection(socket: TcpStream) {
+async fn handle_connection(socket: TcpStream, map: std::sync::Arc<DashMap<String, RESPValue>>) {
     let maybe_addr = socket.peer_addr().ok();
 
     let (mut writer, mut reader) = RESPCodec::default().framed(socket).split();
-
-    let mut map: HashMap<String, RESPValue> = HashMap::new();
 
     while let Some(result) = reader.next().await {
         match result {
@@ -304,7 +303,7 @@ async fn handle_connection(socket: TcpStream) {
                         }
 
                         let commands = values.into_iter().map(|v| v.into_blob_string().unwrap()).collect();
-                        match handle_request(commands, &mut map) {
+                        match handle_request(commands, map.clone()) {
                             Ok(response) => writer.send(response).await.unwrap(),
                             Err(e) => eprintln!("Error: {:?}", e)
                         }
@@ -324,9 +323,10 @@ async fn handle_connection(socket: TcpStream) {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    let map: std::sync::Arc<DashMap<String, RESPValue>> = std::sync::Arc::new(DashMap::new());
     loop {
         let (socket, _) = listener.accept().await?;
         match socket.peer_addr() {
@@ -334,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cfg!(debug_assertions) {
                     println!("New connection from {}", addr);
                 }
-                tokio::spawn(handle_connection(socket));
+                tokio::spawn(handle_connection(socket, map.clone()));
             },
             Err(e) => {
                 eprintln!("Failed to get the address of a new connection: {:?}", e);
